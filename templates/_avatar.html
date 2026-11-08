@@ -1,0 +1,1 @@
+{% macro avatar(p, size='') %}<span class="avatar {{size}}"><span class="ini">{{p.name|initials}}</span>{% if p.photo_url %}<img src="{{p.photo_url}}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">{% endif %}</span>{% endmacro %}

@@ -1,0 +1,13 @@
+{% extends 'base.html' %}{% block title %}Import from Excel · EmailRechoutBuddy{% endblock %}{% block content %}
+<a href="{{url_for('index')}}" class="back">← Dashboard</a>
+<div class="pagehead"><div><span class="eyebrow">BULK ADD</span><h1>Import from Excel</h1><p>Upload an .xlsx file. Professors already in the tracker are skipped.</p></div></div>
+<section class="card newform"><form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf_token" value="{{csrf_token}}">
+<label>Excel file (.xlsx)<input type="file" name="file" accept=".xlsx" required></label>
+<p class="hint-inline">The header row needs <strong>Name</strong> and <strong>Email</strong>. Optional columns: University/College, State, Role, Department, Research, Alignment, Score, Tier, Verification, Source, Notes, Photo URL, Status. Every sheet with these headers is read.</p>
+<p class="hint-inline">A row is a duplicate if its email is already tracked, or the same name is already listed at the same college.</p>
+<button class="btn primary">Import</button></form></section>
+{% if result %}<section class="card" style="margin-top:20px"><h2>Result</h2><p><strong>{{result.added|length}}</strong> added · <strong>{{result.dups|length}}</strong> duplicates skipped · <strong>{{result.invalid|length}}</strong> rows skipped (missing name or valid email)</p>
+{% if result.dups %}<details><summary>Duplicates skipped</summary><ul>{% for d in result.dups %}<li>{{d}}</li>{% endfor %}</ul></details>{% endif %}
+{% if result.invalid %}<details><summary>Rows without a valid email</summary><ul>{% for d in result.invalid %}<li>{{d}}</li>{% endfor %}</ul></details>{% endif %}
+{% if result.added %}<details open><summary>Added</summary><ul>{% for d in result.added %}<li>{{d}}</li>{% endfor %}</ul></details>{% endif %}</section>{% endif %}
+{% endblock %}
