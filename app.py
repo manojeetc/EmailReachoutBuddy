@@ -1,16 +1,18 @@
 """EmailRechoutBuddy: local Flask + SQLite + delegated Microsoft Graph OAuth."""
-import os, json, sqlite3, secrets, hmac, re, html
+import os, json, secrets, hmac, re, html
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 import msal
 import nh3
+import psycopg
 import requests
 from markupsafe import Markup
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from flask import Flask, render_template, request, redirect, url_for, session, flash, abort, jsonify
+from storage import connect_database
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / '.env')
@@ -25,7 +27,6 @@ app.secret_key = FLASK_SECRET_KEY
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax',
                   SESSION_COOKIE_SECURE=os.getenv('SESSION_COOKIE_SECURE','false').lower() == 'true',
                   MAX_CONTENT_LENGTH=2 * 1024 * 1024)
-DB = Path(os.getenv('DATABASE_PATH', str(ROOT / 'outreach.sqlite3')))
 GRAPH = 'https://graph.microsoft.com/v1.0'
 AUTHORITY = 'https://login.microsoftonline.com/consumers'
 SCOPES = ['Mail.Read', 'Mail.Send', 'Mail.ReadWrite', 'User.Read']  # MSAL requests offline_access automatically
@@ -54,51 +55,21 @@ STATUS_NAMES = [s for s, _ in STATUSES]
 
 def now(): return datetime.now(timezone.utc).isoformat(timespec='seconds')
 def db():
-    c = sqlite3.connect(DB)
-    c.row_factory = sqlite3.Row
-    c.execute('PRAGMA foreign_keys=ON')
-    return c
+    return connect_database()
 
 
 def init_db():
     with db() as c:
-        c.executescript('''
-        CREATE TABLE IF NOT EXISTS professors (
-          id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-          university TEXT DEFAULT '', role TEXT DEFAULT '', department TEXT DEFAULT '',
-          research TEXT DEFAULT '', alignment TEXT DEFAULT '', score INTEGER DEFAULT 0,
-          tier TEXT DEFAULT '', verification TEXT DEFAULT '', source TEXT DEFAULT '',
-          notes TEXT DEFAULT '', stage TEXT DEFAULT 'Not contacted',
-          followup_days INTEGER NOT NULL DEFAULT 7, created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS drafts (
-          professor_id INTEGER PRIMARY KEY REFERENCES professors(id) ON DELETE CASCADE,
-          subject TEXT NOT NULL, body TEXT NOT NULL, updated_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS outbound (
-          id INTEGER PRIMARY KEY, professor_id INTEGER NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
-          subject TEXT NOT NULL, body TEXT NOT NULL, sent_at TEXT NOT NULL,
-          graph_id TEXT, conversation_id TEXT, kind TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS inbound (
-          id INTEGER PRIMARY KEY, professor_id INTEGER NOT NULL REFERENCES professors(id) ON DELETE CASCADE,
-          graph_id TEXT NOT NULL UNIQUE, conversation_id TEXT, subject TEXT, received_at TEXT,
-          from_email TEXT, preview TEXT, match_type TEXT NOT NULL, flagged_response INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        ''')
-        for table, col, ddl in (('professors','photo_url',"TEXT DEFAULT ''"),
-                                ('professors','status',"TEXT DEFAULT 'Identified'"),
-                                ('professors','state',"TEXT DEFAULT ''"),
-                                ('professors','category',"TEXT DEFAULT 'None'"),
-                                ('professors','my_notes',"TEXT DEFAULT ''"),
-                                ('inbound','body',"TEXT DEFAULT ''")):
-            if col not in {r['name'] for r in c.execute(f'PRAGMA table_info({table})')}:
-                c.execute(f'ALTER TABLE {table} ADD COLUMN {col} {ddl}')
-                if col == 'state': c.execute("UPDATE professors SET state='Ohio' WHERE university LIKE '%(Columbus)%'")
-        count = c.execute('SELECT COUNT(*) FROM professors').fetchone()[0]
+        try:
+            count = c.execute('SELECT COUNT(*) AS count FROM professors').fetchone()['count']
+        except psycopg.errors.UndefinedTable as exc:
+            raise RuntimeError('Supabase schema is missing. Run supabase/schema.sql in the Supabase SQL Editor first.') from exc
         if count == 0:
             for item in json.loads((ROOT / 'seed_professors.json').read_text(encoding='utf-8')):
                 if not item['email'] or '@' not in str(item['email']): continue
-                c.execute('''INSERT OR IGNORE INTO professors
+                c.execute('''INSERT INTO professors
                 (name,email,university,role,department,research,alignment,score,tier,verification,source,notes,created_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''', tuple(item.get(k) or '' for k in
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING''', tuple(item.get(k) or '' for k in
                 ('name','email','university','role','department','research','alignment','score','tier','verification','source','notes')) + (now(),))
 
 
@@ -135,7 +106,7 @@ def inject(): return {'csrf_token':session.get('csrf',''), 'mail_connected':bool
 
 def category_list():
     with db() as c:
-        return [r[0] for r in c.execute("SELECT DISTINCT category FROM professors WHERE COALESCE(category,'') NOT IN ('','None') ORDER BY category COLLATE NOCASE")]
+        return [r['category'] for r in c.execute("SELECT category FROM professors WHERE COALESCE(category,'') NOT IN ('','None') GROUP BY category ORDER BY MIN(lower(category))")]
 
 def norm_category(value, known):
     value=re.sub(r'\s+',' ',str(value or '')).strip()[:80]
@@ -145,7 +116,7 @@ def norm_category(value, known):
 
 def clean_category(value, exclude_id=0):
     with db() as c:
-        known={r[0].casefold():r[0] for r in c.execute("SELECT DISTINCT category FROM professors WHERE id!=? AND COALESCE(category,'') NOT IN ('','None')",(exclude_id,))}
+        known={r['category'].casefold():r['category'] for r in c.execute("SELECT DISTINCT category FROM professors WHERE id!=? AND COALESCE(category,'') NOT IN ('','None')",(exclude_id,))}
     return norm_category(value,known)
 
 @app.template_filter('initials')
@@ -256,7 +227,7 @@ def latest_stats(c, p):
     d = dict(p)
     out = c.execute('SELECT COUNT(*) n, MAX(sent_at) last_sent FROM outbound WHERE professor_id=?',(p['id'],)).fetchone()
     ins = c.execute('SELECT COUNT(*) n, MAX(received_at) last_reply FROM inbound WHERE professor_id=? AND flagged_response=1',(p['id'],)).fetchone()
-    possible = c.execute("SELECT COUNT(*) FROM inbound WHERE professor_id=? AND match_type='possible' AND flagged_response=0",(p['id'],)).fetchone()[0]
+    possible = c.execute("SELECT COUNT(*) AS count FROM inbound WHERE professor_id=? AND match_type='possible' AND flagged_response=0",(p['id'],)).fetchone()['count']
     d.update(sent_count=out['n'], last_sent=out['last_sent'], reply_count=ins['n'], last_reply=ins['last_reply'], possible=possible)
     d['due'] = False
     d['needs_reply'] = bool(ins['last_reply'] and (not out['last_sent'] or ins['last_reply'][:19] > out['last_sent'][:19]))
@@ -303,11 +274,11 @@ def add_professor():
         else:
             try:
                 with db() as c:
-                    cur=c.execute('INSERT INTO professors(name,email,university,state,department,research,alignment,notes,photo_url,category,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                    cur=c.execute('INSERT INTO professors(name,email,university,state,department,research,alignment,notes,photo_url,category,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) RETURNING id',
                         (name,email,request.form.get('university',''),request.form.get('state','').strip(),request.form.get('department',''),request.form.get('research',''),request.form.get('alignment',''),request.form.get('notes',''),photo,clean_category(request.form.get('category','')),now()))
-                    pid=cur.lastrowid
+                    pid=cur.fetchone()['id']
                 return redirect(url_for('detail',pid=pid))
-            except sqlite3.IntegrityError: flash('That email is already tracked.','error')
+            except psycopg.IntegrityError: flash('That email is already tracked.','error')
     return render_template('new.html')
 
 @app.route('/professor/<int:pid>')
@@ -353,7 +324,7 @@ def update_professor(pid):
         with db() as c:
             c.execute('UPDATE professors SET '+','.join(f'{f}=?' for f in fields)+',score=?,followup_days=? WHERE id=?',(*values,score,days,pid))
         flash('Professor updated.','ok')
-    except sqlite3.IntegrityError: flash('Another professor already has that email.','error')
+    except psycopg.IntegrityError: flash('Another professor already has that email.','error')
     return redirect(url_for('detail',pid=pid))
 
 @app.route('/professor/<int:pid>/rich',methods=['POST'])
@@ -376,7 +347,7 @@ def save_email(pid):
     if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+',email): return jsonify(error='Enter a valid email address.'),400
     try:
         with db() as c: c.execute('UPDATE professors SET email=? WHERE id=?',(email,pid))
-    except sqlite3.IntegrityError: return jsonify(error='Another professor already has that email.'),409
+    except psycopg.IntegrityError: return jsonify(error='Another professor already has that email.'),409
     return jsonify(email=email)
 
 @app.route('/professor/<int:pid>/my-notes',methods=['POST'])
@@ -599,12 +570,12 @@ def sync():
                     conv=m.get('conversationId','')
                     confirmed=bool(by_conv.get((pid,conv)))
                     # Avoid interpreting unrelated historical emails as replies.
-                    sent=c.execute('SELECT MIN(sent_at) FROM outbound WHERE professor_id=?',(pid,)).fetchone()[0]
+                    sent=c.execute('SELECT MIN(sent_at) AS sent_at FROM outbound WHERE professor_id=?',(pid,)).fetchone()['sent_at']
                     if not sent or m.get('receivedDateTime','') < sent[:19]: continue
                     match_type='thread' if confirmed else 'possible'
                     text=((m.get('body') or {}).get('content') or '')[:6000]
-                    cur=c.execute('''INSERT OR IGNORE INTO inbound(professor_id,graph_id,conversation_id,subject,received_at,from_email,preview,match_type,flagged_response,body)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)''',(pid,m['id'],conv,m.get('subject',''),m.get('receivedDateTime',''),sender,m.get('bodyPreview',''),match_type,int(confirmed),text))
+                    cur=c.execute('''INSERT INTO inbound(professor_id,graph_id,conversation_id,subject,received_at,from_email,preview,match_type,flagged_response,body)
+                    VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING''',(pid,m['id'],conv,m.get('subject',''),m.get('receivedDateTime',''),sender,m.get('bodyPreview',''),match_type,int(confirmed),text))
                     c.execute("UPDATE inbound SET body=? WHERE graph_id=? AND COALESCE(body,'')=''",(text,m['id']))
                     inserted+=cur.rowcount
                     if match_type=='possible': possible+=cur.rowcount
@@ -646,6 +617,7 @@ IMPORT_ALIASES = {
     'verification':('verification','contactverification'),
     'source':('source','sourcelink','url','link'),
     'notes':('notes','note','caveats'),
+    'my_notes':('mynotes','personalnotes'),
     'photo_url':('photo','photourl','image','imageurl'),
     'status':('status',),
 }
@@ -692,7 +664,7 @@ def import_excel():
                 with db() as c:
                     emails = {r['email'].lower() for r in c.execute('SELECT email FROM professors')}
                     names = {(r['name'].casefold(), (r['university'] or '').casefold()) for r in c.execute('SELECT name,university FROM professors')}
-                    known = {r[0].casefold(): r[0] for r in c.execute("SELECT DISTINCT category FROM professors WHERE COALESCE(category,'') NOT IN ('','None')")}
+                    known = {r['category'].casefold(): r['category'] for r in c.execute("SELECT DISTINCT category FROM professors WHERE COALESCE(category,'') NOT IN ('','None')")}
                     for r in rows:
                         name = r.get('name', '')
                         m = EMAIL_RE.search(r.get('email', ''))
@@ -705,10 +677,10 @@ def import_excel():
                         except ValueError: score = 0
                         status = next((s for s in STATUS_NAMES if s.lower() == r.get('status', '').lower()), 'Identified')
                         cat = norm_category(r.get('category', ''), known)
-                        c.execute('''INSERT INTO professors(name,email,university,state,role,department,research,alignment,score,tier,verification,source,notes,photo_url,status,category,created_at)
-                                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                        c.execute('''INSERT INTO professors(name,email,university,state,role,department,research,alignment,score,tier,verification,source,notes,my_notes,photo_url,status,category,created_at)
+                                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                                   (name, email, r.get('university',''), r.get('state',''), r.get('role',''), r.get('department',''), r.get('research',''),
-                                   r.get('alignment',''), score, r.get('tier',''), r.get('verification',''), r.get('source',''), r.get('notes',''),
+                                   r.get('alignment',''), score, r.get('tier',''), r.get('verification',''), r.get('source',''), r.get('notes',''), r.get('my_notes',''),
                                    clean_photo(r.get('photo_url','')) or '', status, cat, now()))
                         if cat != 'None': known[cat.casefold()] = cat
                         emails.add(email.lower()); names.add(key); added.append(name)
@@ -716,18 +688,43 @@ def import_excel():
                 flash(f'Imported {len(added)} new, skipped {len(dups)} duplicates and {len(invalid)} rows without a name or valid email.', 'ok')
     return render_template('import.html', result=result)
 
-@app.route('/export.csv')
+@app.route('/export.xlsx')
 @require_login
-def export_csv():
-    import csv,io
-    from flask import Response
-    out=io.StringIO();w=csv.writer(out)
-    w.writerow(['Name','Email','University','State','Category','Department','Tier','Score','Status','Email Status','Emails Sent','Confirmed Replies','Last Sent','Last Reply','Follow Up Due','My Notes'])
+def export_excel():
+    from io import BytesIO
+    from flask import send_file
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    headers = ['Name','Email','University','State','Category','Role','Department','Research','Alignment',
+               'Score','Tier','Verification','Source','Notes','Photo URL','Status','My Notes']
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = 'Professors'
+    sheet.append(headers)
+    for cell in sheet[1]:
+        cell.font = Font(bold=True, color='FFFFFF')
+        cell.fill = PatternFill('solid', fgColor='5264D8')
     with db() as c:
-        for p in c.execute('SELECT * FROM professors ORDER BY score DESC').fetchall():
-            x=latest_stats(c,p)
-            w.writerow([x[k] for k in ('name','email','university','state','category','department','tier','score','status','stage','sent_count','reply_count','last_sent','last_reply','due')]+[to_text(x['my_notes'])])
-    return Response(out.getvalue(),mimetype='text/csv',headers={'Content-Disposition':'attachment; filename=outreach_status.csv'})
+        rows = c.execute('SELECT * FROM professors ORDER BY score DESC, name').fetchall()
+        for professor_row in rows:
+            values = [professor_row[key] for key in ('name','email','university','state','category','role','department',
+                      'research','alignment','score','tier','verification','source','notes','photo_url','status','my_notes')]
+            sheet.append(values)
+            for cell in sheet[sheet.max_row]:
+                if isinstance(cell.value, str):
+                    cell.data_type = 's'
+    sheet.freeze_panes = 'A2'
+    sheet.auto_filter.ref = sheet.dimensions
+    for column in sheet.columns:
+        letter = column[0].column_letter
+        width = min(max(max(len(str(cell.value or '')) for cell in column) + 2, 12), 55)
+        sheet.column_dimensions[letter].width = width
+    output = BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                     as_attachment=True, download_name='professors_import_ready.xlsx')
 
 if __name__=='__main__':
     init_db()

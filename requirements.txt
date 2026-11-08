@@ -5,3 +5,4 @@ python-dotenv>=1.0,<2
 cryptography>=42,<47
 openpyxl>=3.1,<4
 nh3>=0.2.18
+psycopg[binary]>=3.2,<3.3

@@ -10,7 +10,7 @@ A **local Flask app** to track professor research outreach from draft through re
 - Sends via Microsoft Graph authenticated as your `@live.com` account; records date, content, and conversation ID.
 - Manual follow-up draft generation, default due after 7 days; never auto-sends.
 - Sync your inbox on demand; exact Graph conversation matches are marked as replies; other messages from matching professor addresses are flagged **possible** until you review.
-- CSV export, local SQLite database, encrypted persistent MSAL token cache, workspace-password protection, CSRF checking.
+- Import-compatible Excel export (using the same headers as Excel import), Supabase PostgreSQL database, encrypted persistent MSAL token cache, workspace-password protection, CSRF checking.
 - Professor photo (paste an image URL; initials shown as fallback), a manually set 13-step **Status** pipeline, and a separate **Email Status**.
 - AI drafting via the OpenAI API (`OPENAI_API_KEY`, `OPENAI_MODEL`, `SENDER_NAME`, `SENDER_PROFILE` in `.env`): generates the first email, a follow-up, or a reply from the email chain and research profile. Drafts are never sent automatically.
 - Reply to a professor's message from the timeline (sent in the same Outlook thread). Run **Sync inbox** to load full message text.
@@ -26,29 +26,27 @@ In Microsoft Entra App registrations, select your **personal Microsoft accounts*
 
 Personal `@live.com` works with **delegated** OAuth login. Application-only mail access is not used.
 
-## 2. Install and configure
+## 2. Supabase setup, data migration, and run
 
-```powershell
-cd professor_outreach_app
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-Copy-Item .env.example .env
-```
+1. **Rotate any database password shared in chat.** It must be considered compromised. Reset it in the Supabase Dashboard before connecting this app. Do not send the replacement password in chat or commit it.
+2. Copy the connection host/port/database/user from **Project Settings → Database → Connect**. The project may require its session pooler settings if a direct connection is unavailable.
+3. Add either `SUPABASE_DB_CON_STRING` with the **Session Pooler** URI, or the individual `SUPABASE_DB_HOST`, `SUPABASE_DB_PORT`, `SUPABASE_DB_NAME`, `SUPABASE_DB_USER`, and `SUPABASE_DB_PASSWORD` values to the existing `.env` (keep the generated app secrets already there). The direct database host can be IPv6-only; the Session Pooler is the recommended option when direct DNS/connection fails. Never share the connection string or put a database password or service-role key in browser code. The `sb_publishable_...` key is not a database password and is not used by this server-side Flask app.
+4. Install the driver, apply [`supabase/schema.sql`](supabase/schema.sql) through the Supabase SQL Editor or with `python apply_supabase_schema.py`, then move the existing SQLite records (professors, drafts, email history, inbox history, and settings) to Supabase. Run these commands **before** starting the app:
 
-Create strong keys with:
+	```sh
+	source .venv/bin/activate
+	python -m pip install -r requirements.txt
+	python apply_supabase_schema.py
+	python migrate_sqlite_to_supabase.py
+	```
 
-```powershell
-python -c "import secrets; from cryptography.fernet import Fernet; print('FLASK_SECRET_KEY=' + secrets.token_urlsafe(48)); print('TOKEN_ENCRYPTION_KEY=' + Fernet.generate_key().decode())"
-```
+	The migration is safe to rerun: existing rows are not overwritten, and the local `outreach.sqlite3` is left unchanged. It copies the encrypted Outlook token cache from `settings`; keeping the same `TOKEN_ENCRYPTION_KEY` preserves the ability to use it.
 
-Paste the resulting values in `.env`, and configure `CLIENT_ID`, `CLIENT_SECRET`, `APP_PASSWORD` and `TARGET_EMAIL`.
+5. Start the website:
 
-Run:
-
-```powershell
-python app.py
-```
+	```sh
+	python app.py
+	```
 
 Browse **http://localhost:5000**, enter your **APP_PASSWORD**, then click **Connect Microsoft Outlook** and sign in as `manojeet@live.com`.
 
@@ -74,4 +72,4 @@ Browse **http://localhost:5000**, enter your **APP_PASSWORD**, then click **Conn
 
 ## Data storage
 
-`outreach.sqlite3` in this project folder. Remove it only if you intentionally want to reset all tracker records (including sent/reply history). `seed_professors.json` is the spreadsheet-import snapshot; the original workbook isn't modified.
+Supabase PostgreSQL is the live backend. The schema is in [`supabase/schema.sql`](supabase/schema.sql); the original SQLite file remains as a local backup after migration. Do not delete it until you have verified the imported records in the website and Supabase. `seed_professors.json` is the spreadsheet-import snapshot; the original workbook isn't modified.

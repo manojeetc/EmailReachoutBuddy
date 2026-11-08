@@ -49,6 +49,12 @@ a:hover{color:var(--accent-strong)}
 
 .shell{max-width:1360px;margin:0 auto;padding:32px 25px 80px}
 footer{text-align:center;color:var(--muted);font-size:12px;padding:25px}
+.owner-banner{display:flex;align-items:center;gap:12px;margin:0 0 22px;padding:12px 16px;border:1px solid var(--line);border-radius:14px;background:linear-gradient(110deg,var(--surface),var(--surface-2));color:var(--muted);font-size:13px}
+.owner-mark{display:grid;place-items:center;width:30px;height:30px;border-radius:10px;background:var(--ok-soft);color:var(--ok);font-size:13px}
+.owner-banner strong,.owner-banner a{display:block}
+.owner-banner strong{color:var(--ink);font-size:12px}
+.owner-banner a{color:var(--accent);font-weight:650}
+.owner-project{margin-left:auto;font-size:11px}
 
 /* Headings */
 .pagehead{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;gap:20px}
