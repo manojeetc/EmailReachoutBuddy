@@ -11,6 +11,7 @@ A **local Flask app** to track professor research outreach from draft through re
 - Manual follow-up draft generation, default due after 7 days; never auto-sends.
 - Sync your inbox on demand; exact Graph conversation matches are marked as replies; other messages from matching professor addresses are flagged **possible** until you review.
 - Import-compatible Excel export (using the same headers as Excel import), Supabase PostgreSQL database, encrypted persistent MSAL token cache, workspace-password protection, CSRF checking.
+- Event Management: searchable Events and Event Search views, next-occurrence-per-event or all-occurrence modes, linked details, grade filters, profile-style event editing with rich text and an optional image URL, tentative master-event dates, and independent active toggles backed by `events` and `event_occurrences`.
 - Professor photo (paste an image URL; initials shown as fallback), a manually set 13-step **Status** pipeline, and a separate **Email Status**.
 - AI drafting via the OpenAI API (`OPENAI_API_KEY`, `OPENAI_MODEL`, `SENDER_NAME`, `SENDER_PROFILE` in `.env`): generates the first email, a follow-up, or a reply from the email chain and research profile. Drafts are never sent automatically.
 - Reply to a professor's message from the timeline (sent in the same Outlook thread). Run **Sync inbox** to load full message text.

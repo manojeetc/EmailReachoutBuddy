@@ -101,7 +101,7 @@ def csrf_protection():
 
 @app.context_processor
 def inject(): return {'csrf_token':session.get('csrf',''), 'mail_connected':bool(get_setting('token_cache')),
-                      'target_email':TARGET_EMAIL, 'today': datetime.now(timezone.utc).date().isoformat(),
+                      'target_email':TARGET_EMAIL, 'today': datetime.now(timezone.utc).date(),
                       'statuses':STATUSES, 'ai_enabled':bool(OPENAI_API_KEY), 'categories':category_list()}
 
 def category_list():
@@ -118,6 +118,72 @@ def clean_category(value, exclude_id=0):
     with db() as c:
         known={r['category'].casefold():r['category'] for r in c.execute("SELECT DISTINCT category FROM professors WHERE id!=? AND COALESCE(category,'') NOT IN ('','None')",(exclude_id,))}
     return norm_category(value,known)
+
+
+EVENT_FIELDS = ('event_name','event_class','sub_category','original_category','event_type','event_status',
+                'event_contact_info','best_known_start_date','best_known_end_date','best_known_start_time',
+                'best_known_end_time','location_format','location_url','event_notes','image_url')
+EVENT_RICH_FIELDS = ('event_notes','event_contact_info')
+OCCURRENCE_FIELDS = ('occurrence_name','event_start','event_end','om_grade','occurrence_status','next_action_status',
+                     'next_action','occurrence_contact_info','occurrence_notes','favorite')
+
+
+def parse_date(value, label):
+    value = (value or '').strip()
+    if not value: return None
+    try: return datetime.strptime(value, '%Y-%m-%d').date()
+    except ValueError: raise ValueError(f'{label} must use YYYY-MM-DD format.')
+
+
+def parse_time(value, label):
+    value = (value or '').strip()
+    if not value: return None
+    for pattern in ('%H:%M', '%H:%M:%S'):
+        try: return datetime.strptime(value, pattern).time()
+        except ValueError: pass
+    raise ValueError(f'{label} must use a valid time.')
+
+
+def event_form_values(form):
+    values = {field: form.get(field, '').strip() or None for field in EVENT_FIELDS}
+    if not values['event_name'] or not values['event_class']:
+        raise ValueError('Event name and event class are required.')
+    values['event_status'] = values['event_status'] or 'Active'
+    for field, label in (('best_known_start_time','Best-known start time'),('best_known_end_time','Best-known end time')):
+        values[field] = parse_time(values[field], label)
+    if values['location_url'] and not re.fullmatch(r'https?://\S+', values['location_url'], re.I):
+        raise ValueError('Location URL must start with http:// or https://.')
+    if values['image_url'] and not re.fullmatch(r'https?://\S+', values['image_url'], re.I):
+        raise ValueError('Image URL must start with http:// or https://.')
+    for field in EVENT_RICH_FIELDS:
+        values[field] = sanitize_rich(values[field] or '')
+    return values
+
+
+def occurrence_form_values(form):
+    values = {field: form.get(field, '').strip() or None for field in OCCURRENCE_FIELDS}
+    if not values['occurrence_name']:
+        raise ValueError('Occurrence name is required (for example, Registration or Olympiad exam).')
+    values['event_start'] = parse_date(values['event_start'], 'Occurrence start date')
+    values['event_end'] = parse_date(values['event_end'], 'Occurrence end date')
+    values['favorite'] = form_active(form)
+    if values['event_start'] and values['event_end'] and values['event_end'] < values['event_start']:
+        raise ValueError('Occurrence end date must be on or after its start date.')
+    summary = values['next_action_status']
+    if summary:
+        word_count = len(summary.split())
+        if word_count not in (5, 6):
+            raise ValueError('Next action status must summarize the action in exactly 5 or 6 words.')
+    return values
+
+
+def form_active(form):
+    return form.get('active') in ('on', 'true', '1')
+
+
+def safe_local_return(value, fallback):
+    value = (value or '').strip()
+    return value if value.startswith('/') and not value.startswith('//') else fallback
 
 @app.template_filter('initials')
 def initials(name):
@@ -262,6 +328,285 @@ def index():
              'replied':sum(p['reply_count']>0 for p in people),'due':sum(p['due'] for p in people),
              'possible':sum(p['possible']>0 for p in people)}
     return render_template('index.html', people=people, stats=stats, q=q)
+
+
+EVENT_FORM_FIELDS = [
+    ('event_name','Event name','text','general'), ('event_class','Event class','text','general'),
+    ('sub_category','Subcategory','text','general'), ('original_category','Original category','text','general'),
+    ('event_type','Event type','text','general'), ('event_status','Event status','text','general'),
+    ('best_known_start_date','Tentative start (e.g. Spring 2027)','text','schedule'),
+    ('best_known_end_date','Tentative end (e.g. Late Spring 2027)','text','schedule'),
+    ('best_known_start_time','Best-known start time','time','schedule'),
+    ('best_known_end_time','Best-known end time','time','schedule'),
+    ('event_contact_info','Event contact information','richtext','contact'),
+    ('location_format','Location format','text','location'), ('location_url','Location URL','url','location'),
+    ('image_url','Image URL','url','location'), ('event_notes','Description / event notes','richtext','description')]
+OCCURRENCE_FORM_FIELDS = [
+    ('occurrence_name','Occurrence name (e.g. Registration, Olympiad exam)','text'),
+    ('event_start','Start date','date'), ('event_end','End date','date'),
+    ('om_grade',"Om's grade",'text'), ('occurrence_status','Occurrence status','text'),
+    ('next_action_status','Next action status · 5–6 words','text'),
+    ('next_action','Next action','textarea'), ('occurrence_contact_info','Contact','textarea'),
+    ('occurrence_notes','Occurrence notes','textarea'), ('favorite','Favorite occurrence','checkbox')]
+
+
+@app.route('/main-events')
+@require_login
+def main_events():
+    return redirect(url_for('events'), code=301)
+
+
+@app.route('/occurrences')
+@require_login
+def legacy_occurrence_search():
+    return redirect(url_for('event_search', **request.args), code=301)
+
+
+@app.route('/events')
+@require_login
+def events():
+    try:
+        with db() as c:
+            rows = c.execute('''SELECT e.*,
+                (SELECT MIN(o.event_start) FROM event_occurrences o
+                 WHERE o.event_id=e.id AND o.active=true AND o.event_start>=CURRENT_DATE) AS next_occurrence,
+                (SELECT COUNT(*) FROM event_occurrences o WHERE o.event_id=e.id) AS occurrence_count
+                FROM events e ORDER BY e.active DESC, e.event_name''').fetchall()
+    except psycopg.Error:
+        app.logger.exception('Could not load events list')
+        return render_template('events.html', events=[], load_error=True, event_fields=EVENT_FORM_FIELDS)
+    options = {
+        'event_classes': sorted({row['event_class'] for row in rows if row['event_class']}),
+        'subcategories': sorted({row['sub_category'] for row in rows if row['sub_category']}),
+        'event_types': sorted({row['event_type'] for row in rows if row['event_type']}),
+        'event_statuses': sorted({row['event_status'] for row in rows if row['event_status']}),
+    }
+    return render_template('events.html', events=rows, load_error=False, event_fields=EVENT_FORM_FIELDS,
+                           options=options, return_to=request.full_path.rstrip('?'))
+
+
+@app.route('/events/new', methods=['GET','POST'])
+@require_login
+def add_event():
+    event = dict(request.form) if request.method == 'POST' else {'event_status':'Active','active':'on'}
+    if request.method == 'POST':
+        try:
+            values = event_form_values(request.form)
+            columns = ', '.join(EVENT_FIELDS)
+            placeholders = ', '.join('?' for _ in EVENT_FIELDS)
+            with db() as c:
+                c.execute(f'INSERT INTO events ({columns},active,updated_at) VALUES ({placeholders},?,now())',
+                          (*(values[field] for field in EVENT_FIELDS), form_active(request.form)))
+            flash('Event created.', 'ok')
+            return redirect(url_for('events'))
+        except ValueError as exc: flash(str(exc), 'error')
+        except psycopg.IntegrityError: flash('An event with that name already exists.', 'error')
+    return render_template('event_form.html', event=event, fields=EVENT_FORM_FIELDS, mode='Add')
+
+
+@app.route('/events/<int:event_id>')
+@require_login
+def event_detail(event_id):
+    try:
+        with db() as c:
+            event = c.execute('SELECT * FROM events WHERE id=?',(event_id,)).fetchone()
+            if not event: abort(404)
+            occurrences = c.execute('''SELECT * FROM event_occurrences WHERE event_id=?
+                ORDER BY CASE WHEN event_start>=CURRENT_DATE THEN 0 ELSE 1 END,
+                         CASE WHEN event_start>=CURRENT_DATE THEN event_start END ASC,
+                         CASE WHEN event_start<CURRENT_DATE THEN event_start END DESC NULLS LAST,
+                         id DESC''',(event_id,)).fetchall()
+    except psycopg.Error:
+        app.logger.exception('Could not load event details')
+        return render_template('event_detail.html', event=None, occurrences=[], occurrence_fields=OCCURRENCE_FORM_FIELDS, load_error=True)
+    options={
+        'statuses':sorted({r['occurrence_status'] for r in occurrences if r['occurrence_status']}),
+        'grades':sorted({r['om_grade'] for r in occurrences if r['om_grade']}),
+    }
+    return render_template('event_detail.html', event=event, occurrences=occurrences,
+                           occurrence_fields=OCCURRENCE_FORM_FIELDS, options=options, load_error=False,
+                           return_to=safe_local_return(request.args.get('return_to'),url_for('events')))
+
+
+@app.route('/events/<int:event_id>/edit', methods=['GET','POST'])
+@require_login
+def edit_event(event_id):
+    try:
+        with db() as c: existing = c.execute('SELECT * FROM events WHERE id=?',(event_id,)).fetchone()
+    except psycopg.Error:
+        app.logger.exception('Could not load event for editing')
+        flash('Event could not be loaded. Check the Supabase connection and try again.','error')
+        return redirect(url_for('events'))
+    if not existing: abort(404)
+    event = existing
+    if request.method == 'POST':
+        try:
+            values = event_form_values(request.form)
+            assignments = ', '.join(f'{field}=?' for field in EVENT_FIELDS)
+            with db() as c:
+                c.execute(f'UPDATE events SET {assignments},active=?,updated_at=now() WHERE id=?',
+                          (*(values[field] for field in EVENT_FIELDS),form_active(request.form),event_id))
+            flash('Event updated.', 'ok')
+            return redirect(url_for('event_detail',event_id=event_id))
+        except ValueError as exc: flash(str(exc), 'error')
+        except psycopg.IntegrityError: flash('An event with that name already exists.', 'error')
+        event = dict(existing); event.update(request.form)
+    return render_template('event_form.html',event=event,fields=EVENT_FORM_FIELDS,mode='Edit')
+
+
+@app.route('/events/<int:event_id>/rich', methods=['POST'])
+@require_login
+def save_event_rich(event_id):
+    field=request.form.get('field','')
+    if field not in EVENT_RICH_FIELDS: abort(400)
+    with db() as c:
+        event=c.execute('SELECT id FROM events WHERE id=?',(event_id,)).fetchone()
+        if not event: abort(404)
+        clean=sanitize_rich(request.form.get('html','')[:50000])
+        if not to_text(clean): clean=''
+        c.execute(f'UPDATE events SET {field}=?,updated_at=now() WHERE id=?',(clean,event_id))
+    flash('Event information saved.','ok')
+    return redirect(url_for('event_detail',event_id=event_id)+'#field-'+field)
+
+
+@app.route('/events/<int:event_id>/active', methods=['POST'])
+@require_login
+def toggle_event_active(event_id):
+    active = form_active(request.form)
+    with db() as c:
+        cursor = c.execute('UPDATE events SET active=?,updated_at=now() WHERE id=?',(active,event_id))
+    if not cursor.rowcount: abort(404)
+    flash('Event activated.' if active else 'Event deactivated. Occurrences were not changed.', 'ok')
+    return redirect(safe_local_return(request.form.get('return_to'),url_for('event_detail',event_id=event_id)))
+
+
+@app.route('/events/<int:event_id>/occurrences/new', methods=['GET','POST'])
+@require_login
+def add_occurrence(event_id):
+    try:
+        with db() as c: event = c.execute('SELECT id,event_name FROM events WHERE id=?',(event_id,)).fetchone()
+    except psycopg.Error:
+        app.logger.exception('Could not load parent event for new occurrence')
+        flash('Parent event could not be loaded. Check the Supabase connection and try again.','error')
+        return redirect(url_for('events'))
+    if not event: abort(404)
+    occurrence = dict(request.form) if request.method == 'POST' else {'active':'on','favorite':'on','om_grade':'Grade 8'}
+    if request.method == 'POST':
+        try:
+            values = occurrence_form_values(request.form)
+            columns = ', '.join(OCCURRENCE_FIELDS)
+            placeholders = ', '.join('?' for _ in OCCURRENCE_FIELDS)
+            with db() as c:
+                c.execute(f'INSERT INTO event_occurrences (event_id,{columns},active,updated_at) VALUES (?,{placeholders},?,now())',
+                          (event_id,*(values[field] for field in OCCURRENCE_FIELDS),form_active(request.form)))
+            flash('Occurrence added.', 'ok')
+            return redirect(url_for('event_detail',event_id=event_id))
+        except ValueError as exc: flash(str(exc), 'error')
+    return render_template('occurrence_form.html',occurrence=occurrence,fields=OCCURRENCE_FORM_FIELDS,
+                           mode='Add',event=event,parent_event_id=event_id)
+
+
+@app.route('/occurrences/<int:occurrence_id>')
+@require_login
+def occurrence_detail(occurrence_id):
+    try:
+        with db() as c:
+            occurrence = c.execute('''SELECT o.*, e.event_name,e.event_class,e.sub_category,e.event_type,e.event_status,e.active AS event_active
+                FROM event_occurrences o JOIN events e ON e.id=o.event_id WHERE o.id=?''',(occurrence_id,)).fetchone()
+    except psycopg.Error:
+        app.logger.exception('Could not load occurrence details')
+        flash('Occurrence details could not be loaded. Check the Supabase connection and try again.','error')
+        return redirect(url_for('event_search'))
+    if not occurrence: abort(404)
+    return render_template('occurrence_detail.html',occurrence=occurrence)
+
+
+@app.route('/event-search')
+@require_login
+def event_search():
+    try:
+        with db() as c:
+            rows = c.execute('''SELECT o.*,e.event_name,e.event_class,e.sub_category,e.event_type,e.event_status,
+                e.active AS event_active, (o.event_start>=CURRENT_DATE) AS upcoming
+                FROM event_occurrences o JOIN events e ON e.id=o.event_id
+                ORDER BY CASE WHEN o.event_start>=CURRENT_DATE THEN 0 ELSE 1 END,
+                         CASE WHEN o.event_start>=CURRENT_DATE THEN o.event_start END ASC,
+                         CASE WHEN o.event_start<CURRENT_DATE THEN o.event_start END DESC NULLS LAST,
+                         o.id DESC''').fetchall()
+    except psycopg.Error:
+        app.logger.exception('Could not load Event Search')
+        return render_template('occurrence_search.html',occurrences=[],load_error=True,options={})
+    options={
+        'event_classes':sorted({r['event_class'] for r in rows if r['event_class']}),
+        'subcategories':sorted({r['sub_category'] for r in rows if r['sub_category']}),
+        'event_types':sorted({r['event_type'] for r in rows if r['event_type']}),
+        'event_names':sorted({r['event_name'] for r in rows if r['event_name']}),
+        'statuses':sorted({r['occurrence_status'] for r in rows if r['occurrence_status']}),
+        'grades':sorted({r['om_grade'] for r in rows if r['om_grade']}),
+    }
+    return render_template('occurrence_search.html',occurrences=rows,load_error=False,options=options,
+                           view=request.args.get('view','all'), favorites=request.args.get('favorites','only'))
+
+
+@app.route('/occurrences/<int:occurrence_id>/edit', methods=['GET','POST'])
+@require_login
+def edit_occurrence(occurrence_id):
+    try:
+        with db() as c:
+            existing=c.execute('SELECT o.*,e.event_name FROM event_occurrences o JOIN events e ON e.id=o.event_id WHERE o.id=?',(occurrence_id,)).fetchone()
+    except psycopg.Error:
+        app.logger.exception('Could not load occurrence for editing')
+        flash('Occurrence could not be loaded. Check the Supabase connection and try again.','error')
+        return redirect(url_for('event_search'))
+    if not existing: abort(404)
+    occurrence=existing
+    if request.method == 'POST':
+        try:
+            values=occurrence_form_values(request.form)
+            assignments=', '.join(f'{field}=?' for field in OCCURRENCE_FIELDS)
+            with db() as c:
+                c.execute(f'UPDATE event_occurrences SET {assignments},active=?,updated_at=now() WHERE id=?',
+                          (*(values[field] for field in OCCURRENCE_FIELDS),form_active(request.form),occurrence_id))
+            flash('Occurrence updated.','ok')
+            return redirect(url_for('occurrence_detail',occurrence_id=occurrence_id))
+        except ValueError as exc: flash(str(exc),'error')
+        occurrence=dict(existing); occurrence.update(request.form)
+    return render_template('occurrence_form.html',occurrence=occurrence,fields=OCCURRENCE_FORM_FIELDS,
+                           mode='Edit',event={'id':existing['event_id'],'event_name':existing['event_name']},
+                           parent_event_id=existing['event_id'])
+
+
+@app.route('/occurrences/<int:occurrence_id>/active', methods=['POST'])
+@require_login
+def toggle_occurrence_active(occurrence_id):
+    active=form_active(request.form)
+    with db() as c:
+        cursor=c.execute('UPDATE event_occurrences SET active=?,updated_at=now() WHERE id=?',(active,occurrence_id))
+        parent=c.execute('SELECT event_id FROM event_occurrences WHERE id=?',(occurrence_id,)).fetchone()
+    if not cursor.rowcount: abort(404)
+    flash('Occurrence activated.' if active else 'Occurrence deactivated.','ok')
+    return redirect(safe_local_return(request.form.get('return_to'),url_for('occurrence_detail',occurrence_id=occurrence_id)))
+
+
+@app.route('/occurrences/<int:occurrence_id>/favorite', methods=['POST'])
+@require_login
+def toggle_occurrence_favorite(occurrence_id):
+    favorite=request.form.get('favorite') in ('on','true','1')
+    with db() as c:
+        cursor=c.execute('UPDATE event_occurrences SET favorite=?,updated_at=now() WHERE id=?',(favorite,occurrence_id))
+    if not cursor.rowcount: abort(404)
+    flash('Occurrence added to favorites.' if favorite else 'Occurrence removed from favorites.','ok')
+    return redirect(safe_local_return(request.form.get('return_to'),url_for('occurrence_detail',occurrence_id=occurrence_id)))
+
+
+@app.route('/occurrences/<int:occurrence_id>/delete', methods=['POST'])
+@require_login
+def delete_occurrence(occurrence_id):
+    with db() as c:
+        cursor=c.execute('DELETE FROM event_occurrences WHERE id=?',(occurrence_id,))
+    if not cursor.rowcount: abort(404)
+    flash('Occurrence deleted.','ok')
+    return redirect(safe_local_return(request.form.get('return_to'),url_for('event_search')))
 
 @app.route('/professor/new',methods=['GET','POST'])
 @require_login
