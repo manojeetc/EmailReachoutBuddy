@@ -166,7 +166,7 @@ def occurrence_form_values(form):
         raise ValueError('Occurrence name is required (for example, Registration or Olympiad exam).')
     values['event_start'] = parse_date(values['event_start'], 'Occurrence start date')
     values['event_end'] = parse_date(values['event_end'], 'Occurrence end date')
-    values['favorite'] = form_active(form)
+    values['favorite'] = form.get('favorite') in ('on', 'true', '1')
     if values['event_start'] and values['event_end'] and values['event_end'] < values['event_start']:
         raise ValueError('Occurrence end date must be on or after its start date.')
     summary = values['next_action_status']
@@ -347,7 +347,7 @@ OCCURRENCE_FORM_FIELDS = [
     ('om_grade',"Om's grade",'text'), ('occurrence_status','Occurrence status','text'),
     ('next_action_status','Next action status · 5–6 words','text'),
     ('next_action','Next action','textarea'), ('occurrence_contact_info','Contact','textarea'),
-    ('occurrence_notes','Occurrence notes','textarea'), ('favorite','Favorite occurrence','checkbox')]
+    ('occurrence_notes','Occurrence notes','textarea')]
 
 
 @app.route('/main-events')
@@ -504,6 +504,22 @@ def add_occurrence(event_id):
         except ValueError as exc: flash(str(exc), 'error')
     return render_template('occurrence_form.html',occurrence=occurrence,fields=OCCURRENCE_FORM_FIELDS,
                            mode='Add',event=event,parent_event_id=event_id)
+
+
+@app.route('/occurrences/new')
+@require_login
+def choose_occurrence_event():
+    event_id = request.args.get('event_id', type=int)
+    if event_id is not None:
+        return redirect(url_for('add_occurrence', event_id=event_id))
+    try:
+        with db() as c:
+            events = c.execute('SELECT id,event_name,active FROM events ORDER BY active DESC,event_name').fetchall()
+    except psycopg.Error:
+        app.logger.exception('Could not load events for adding an occurrence')
+        flash('Could not load events. Check the database connection and try again.', 'error')
+        return redirect(url_for('event_search'))
+    return render_template('choose_occurrence_event.html', events=events)
 
 
 @app.route('/occurrences/<int:occurrence_id>')

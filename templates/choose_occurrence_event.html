@@ -1,0 +1,21 @@
+{% extends 'base.html' %}
+{% block title %}Add occurrence · EmailRechoutBuddy{% endblock %}
+{% block content %}
+<a class="back" href="{{ url_for('event_search') }}">← Event Search</a>
+<div class="pagehead"><div><span class="eyebrow">EVENT MANAGEMENT</span><h1>Add occurrence</h1><p>Choose the event this occurrence belongs to.</p></div></div>
+<section class="card newform">
+  {% if events %}
+  <form method="get" action="{{ url_for('choose_occurrence_event') }}">
+    <label for="event-id">Event</label>
+    <select name="event_id" id="event-id" required>
+      <option value="">Select an event</option>
+      {% for event in events %}<option value="{{ event.id }}">{{ event.event_name }}{% if not event.active %} (inactive){% endif %}</option>{% endfor %}
+    </select>
+    <div class="composeactions"><a class="btn secondary" href="{{ url_for('event_search') }}">Cancel</a><button class="btn primary" type="submit">Continue</button></div>
+  </form>
+  {% else %}
+  <p>No events exist yet. Create an event before adding an occurrence.</p>
+  <a class="btn primary" href="{{ url_for('add_event') }}">Add event</a>
+  {% endif %}
+</section>
+{% endblock %}
