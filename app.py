@@ -1,7 +1,7 @@
 """EmailRechoutBuddy: local Flask + SQLite + delegated Microsoft Graph OAuth."""
 import os, json, secrets, hmac, re, html
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import wraps
 
 import msal
@@ -54,6 +54,29 @@ STATUS_NAMES = [s for s, _ in STATUSES]
 
 
 def now(): return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+@app.template_filter('display_date')
+def display_date(value):
+    """Format dates for people while leaving approximate date descriptions intact."""
+    if not value:
+        return '—'
+    if isinstance(value, datetime):
+        day = value.date()
+    elif isinstance(value, date):
+        day = value
+    elif isinstance(value, str):
+        try:
+            day = date.fromisoformat(value[:10])
+        except ValueError:
+            return value
+    else:
+        return str(value)
+    suffix = 'th' if 11 <= day.day % 100 <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(day.day % 10, 'th')
+    month = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')[day.month - 1]
+    return f'{day.day}{suffix} {month}, {day.year}'
+
+
 def db():
     return connect_database()
 
